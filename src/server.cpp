@@ -2,15 +2,18 @@
 #include <iostream>
 #include <cstring>
 #include <errno.h>
+#include <thread>
 
-WebServer::WebServer(int port, const std::string& doc_root) 
-    : server_fd(-1), port(port), document_root(doc_root) {
+WebServer::WebServer(int port, const std::string& doc_root, size_t thread_count) 
+    : server_fd(-1), port(port), document_root(doc_root), keep_alive_enabled(false), connection_timeout(5) {
     memset(&address, 0, sizeof(address));
     file_handler = new FileHandler(document_root);
+    thread_pool = new ThreadPool(thread_count);
 }
 
 WebServer::~WebServer() {
     cleanup();
+    delete thread_pool;
     delete file_handler;
 }
 
@@ -53,6 +56,7 @@ bool WebServer::initialize() {
 void WebServer::start() {
     std::cout << "Server starting on http://localhost:" << port << std::endl;
     std::cout << "Document root: " << document_root << std::endl;
+    std::cout << "Thread pool size: " << thread_pool->get_thread_count() << std::endl;
     std::cout << "Press Ctrl+C to stop the server" << std::endl;
 
     while (true) {
@@ -67,51 +71,72 @@ void WebServer::start() {
         }
 
         std::cout << "New connection from " << inet_ntoa(client_addr.sin_addr) 
-                  << ":" << ntohs(client_addr.sin_port) << std::endl;
+                  << ":" << ntohs(client_addr.sin_port) 
+                  << " (queue size: " << thread_pool->get_queue_size() << ")" << std::endl;
 
-        // Handle the client request
-        handle_client(client_socket);
-        
-        // Close client socket
-        close(client_socket);
+        // Add client handling to thread pool instead of handling directly
+        thread_pool->enqueue([this, client_socket]() {
+            this->handle_client_task(client_socket);
+        });
     }
 }
 
 void WebServer::handle_client(int client_socket) {
-    // Read the request
-    std::string request_data = read_request(client_socket);
-    
-    if (request_data.empty()) {
-        std::cout << "Empty request received" << std::endl;
-        return;
-    }
+    // This method now just delegates to the thread-safe version
+    handle_client_task(client_socket);
+    close(client_socket);
+}
 
-    // Parse HTTP request
-    HttpRequest request;
-    if (!request.parse(request_data)) {
-        std::cout << "Failed to parse HTTP request" << std::endl;
-        std::string response = build_http_response(400, "Bad Request", 
-                                                 "text/html", 
-                                                 "<html><body><h1>400 Bad Request</h1></body></html>");
+void WebServer::handle_client_task(int client_socket) {
+    // Thread-safe client handling
+    try {
+        std::thread::id thread_id = std::this_thread::get_id();
+        
+        // Read the request
+        std::string request_data = read_request(client_socket);
+        
+        if (request_data.empty()) {
+            std::cout << "[Thread " << thread_id << "] Empty request received" << std::endl;
+            close(client_socket);
+            return;
+        }
+
+        // Parse HTTP request
+        HttpRequest request;
+        if (!request.parse(request_data)) {
+            std::cout << "[Thread " << thread_id << "] Failed to parse HTTP request" << std::endl;
+            std::string response = build_http_response(400, "Bad Request", 
+                                                     "text/html", 
+                                                     "<html><body><h1>400 Bad Request</h1></body></html>");
+            send_response(client_socket, response);
+            close(client_socket);
+            return;
+        }
+
+        // Debug: print request details
+        std::cout << "[Thread " << thread_id << "] Request: " << request.method << " " << request.path << std::endl;
+
+        // Handle different HTTP methods
+        std::string response;
+        if (request.method == "GET") {
+            response = handle_get_request(request);
+        } else {
+            // Method not allowed
+            response = build_http_response(405, "Method Not Allowed", 
+                                         "text/html", 
+                                         "<html><body><h1>405 Method Not Allowed</h1></body></html>");
+        }
+
         send_response(client_socket, response);
-        return;
+        
+        std::cout << "[Thread " << thread_id << "] Request completed" << std::endl;
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Exception in handle_client_task: " << e.what() << std::endl;
     }
-
-    // Debug: print request details
-    std::cout << "Request: " << request.method << " " << request.path << std::endl;
-
-    // Handle different HTTP methods
-    std::string response;
-    if (request.method == "GET") {
-        response = handle_get_request(request);
-    } else {
-        // Method not allowed
-        response = build_http_response(405, "Method Not Allowed", 
-                                     "text/html", 
-                                     "<html><body><h1>405 Method Not Allowed</h1></body></html>");
-    }
-
-    send_response(client_socket, response);
+    
+    // Always close the socket
+    close(client_socket);
 }
 
 std::string WebServer::read_request(int client_socket) {
@@ -147,15 +172,15 @@ void WebServer::cleanup() {
     }
 }
 
-std::string WebServer::build_http_response(int status_code, const std::string& status_text, 
-                                         const std::string& content_type, const std::string& body) {
+std::string WebServer::build_http_response(int status_code, const std::string& status_text,
+                                const std::string& content_type, const std::string& body,
+                                const std::string& connection) {
     std::string response = "HTTP/1.1 " + std::to_string(status_code) + " " + status_text + "\r\n";
     response += "Content-Type: " + content_type + "\r\n";
     response += "Content-Length: " + std::to_string(body.length()) + "\r\n";
-    response += "Connection: close\r\n";
+    response += "Connection: " + connection + "\r\n";
     response += "\r\n";
     response += body;
-    
     return response;
 }
 
@@ -181,4 +206,25 @@ std::string WebServer::handle_get_request(const HttpRequest& request) {
 std::string WebServer::get_404_response() {
     std::string body = "<html><body><h1>404 Not Found</h1><p>The requested file was not found.</p></body></html>";
     return build_http_response(404, "Not Found", "text/html", body);
+}
+
+void WebServer::enable_keep_alive(bool enable, int timeout_seconds) {
+    keep_alive_enabled = enable;
+    connection_timeout = std::chrono::seconds(timeout_seconds);
+    std::cout << "Keep-Alive " << (enable ? "enabled" : "disabled")
+              << " with timeout: " << timeout_seconds << " seconds" << std::endl;
+}
+
+void WebServer::manage_connections() {
+    auto now = std::chrono::steady_clock::now();
+
+    for (auto it = connection_timestamps.begin(); it != connection_timestamps.end(); ) {
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - it->second) > connection_timeout) {
+            close(it->first);
+            std::cout << "Closed idle connection: " << it->first << std::endl;
+            it = connection_timestamps.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }

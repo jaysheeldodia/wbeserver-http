@@ -20,6 +20,7 @@ int main(int argc, char* argv[]) {
 
     int port = 8080;
     std::string doc_root = "./www";
+    size_t thread_count = 4;
 
     // Parse command line arguments
     if (argc > 1) {
@@ -28,9 +29,17 @@ int main(int argc, char* argv[]) {
     if (argc > 2) {
         doc_root = argv[2];
     }
+    if (argc > 3) {
+        thread_count = std::stoi(argv[3]);
+    }
+
+    std::cout << "Starting server with:" << std::endl;
+    std::cout << "  Port: " << port << std::endl;
+    std::cout << "  Document root: " << doc_root << std::endl;
+    std::cout << "  Thread count: " << thread_count << std::endl;
 
     // Create and initialize server
-    WebServer server(port, doc_root);
+    WebServer server(port, doc_root, thread_count);
     server_instance = &server;
 
     if (!server.initialize()) {
